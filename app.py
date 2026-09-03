@@ -579,7 +579,7 @@ class CommandCenterApp(App):
         self.refresh_seconds = REFRESH_SECONDS
 
         columns = {
-            "topics": (("Topic", 20), ("Interface", 20), ("Activity", 20)),
+            "topics": (("Topic", 17), ("Interface", 17), ("Activity", 16)),
             "nodes": (("Node", None), ("Pub", 5), ("Sub", 5), ("Srv", 5), ("Cli", 5)),
             "services": (("Service", None), ("Type", None), ("Servers", 9)),
         }
@@ -588,7 +588,7 @@ class CommandCenterApp(App):
             table.cursor_type = "row"
             table.zebra_stripes = False
             table.show_header = False
-            table.cell_padding = 2 if tab == "topics" else 0
+            table.cell_padding = 1 if tab == "topics" else 0
             for label, width in cols:
                 table.add_column(label, width=width, key=label.lower())
 
