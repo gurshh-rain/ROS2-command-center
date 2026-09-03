@@ -104,8 +104,9 @@ def yaml_inline(value) -> str:
 def topic_name_cell(name: str) -> Text:
     namespace, _, leaf = name.rpartition("/")
     text = Text(leaf or "/", style="bold #f5f5f7", overflow="ellipsis", no_wrap=True)
-    text.append("\n")
-    text.append(namespace or "/", style="#636366")
+    if namespace:
+        text.append("\n")
+        text.append(namespace, style="#636366")
     return text
 
 
@@ -113,7 +114,7 @@ def topic_type_cell(types: list[str]) -> Text:
     if not types:
         return Text("Unknown", style="#636366")
     package, _, interface = types[0].rpartition("/")
-    text = Text(interface, style="#e5e5ea", overflow="ellipsis", no_wrap=True)
+    text = Text(interface, style="bold #f5f5f7", overflow="ellipsis", no_wrap=True)
     text.append("\n")
     suffix = f" +{len(types) - 1}" if len(types) > 1 else ""
     text.append(f"{package.split('/')[0]}{suffix}", style="#636366")
