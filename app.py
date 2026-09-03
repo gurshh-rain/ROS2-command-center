@@ -162,7 +162,7 @@ class CommandForm(ModalScreen[dict | None]):
         height: 10;
         margin-bottom: 1;
         background: #1c1c1e;
-        border: solid #2c2c2e;
+        border: round #2c2c2e;
     }
     #command_buttons {
         height: 3;
@@ -750,6 +750,7 @@ class CommandCenterApp(App):
         self.refresh_timer = self.set_interval(self.refresh_seconds, self.refresh_graph)
         if self.paused:
             self.refresh_timer.pause()
+        self.app.theme = f"textual-{theme}"
         self.app.dark = theme == "dark"
         self.notify_control(
             f"Settings applied: theme={theme}, refresh={self.refresh_seconds:g}s"
