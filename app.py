@@ -26,12 +26,13 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 from rosidl_runtime_py import message_to_yaml, set_message_fields
-from rosidl_runtime_py.utilities import get_message, get_service
+from rosidl_runtime_py.utilities import get_action, get_message, get_service
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, DataTable, Input, Label, Select, Static, TabbedContent, TabPane, TextArea,
+    Button, DataTable, Input, Label, Select, Sparkline, Static, TabbedContent, TabPane,
+    TextArea,
 )
 
 try:
@@ -39,6 +40,14 @@ try:
     _DIAGNOSTICS_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _DIAGNOSTICS_AVAILABLE = False
+
+try:
+    from lifecycle_msgs.msg import Transition as LifecycleTransition
+    from lifecycle_msgs.srv import ChangeState, GetState
+
+    _LIFECYCLE_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _LIFECYCLE_AVAILABLE = False
 
 try:
     from rclpy.action.graph import (
@@ -49,6 +58,13 @@ try:
     _ACTIONS_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _ACTIONS_AVAILABLE = False
+
+try:
+    from rclpy.action import ActionClient
+
+    _ACTION_CLIENT_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _ACTION_CLIENT_AVAILABLE = False
 
 try:
     from tf2_msgs.msg import TFMessage
@@ -70,6 +86,16 @@ DIAGNOSTIC_LEVELS = {
     2: ("ERROR", "#ff4f55"),
     3: ("STALE", "#8e8e93"),
 } if _DIAGNOSTICS_AVAILABLE else {}
+
+LIFECYCLE_TRANSITIONS = {}
+if _LIFECYCLE_AVAILABLE:
+    LIFECYCLE_TRANSITIONS = {
+        "configure": LifecycleTransition.TRANSITION_CONFIGURE,
+        "cleanup": LifecycleTransition.TRANSITION_CLEANUP,
+        "activate": LifecycleTransition.TRANSITION_ACTIVATE,
+        "deactivate": LifecycleTransition.TRANSITION_DEACTIVATE,
+        "shutdown": LifecycleTransition.TRANSITION_ACTIVE_SHUTDOWN,
+    }
 
 REFRESH_SECONDS = 2.0
 SPIN_SECONDS = 0.02
@@ -99,6 +125,58 @@ def qos_summary(qos: QoSProfile) -> str:
 
 def yaml_inline(value) -> str:
     return yaml.safe_dump(value, default_flow_style=True).replace("\n...", "").strip()
+
+
+def interface_definition_lines(type_name: str, kind: str = "msg") -> list[str]:
+    """Return rich-text lines describing a msg/srv/action interface."""
+    try:
+        if kind == "msg":
+            cls = get_message(type_name)
+            sections = [("fields", cls)]
+        elif kind == "srv":
+            cls = get_service(type_name)
+            sections = [("request", cls.Request), ("response", cls.Response)]
+        elif kind == "action":
+            cls = get_action(type_name)
+            sections = [
+                ("goal", cls.Goal),
+                ("result", cls.Result),
+                ("feedback", cls.Feedback),
+            ]
+        else:
+            return []
+    except Exception as exc:
+        return [f"  [red]cannot load {kind} {type_name}: {exc}[/]"]
+
+    out = []
+    for title, section_cls in sections:
+        out.append(f"  [b]{title}[/]")
+        fields = section_cls.get_fields_and_field_types()
+        if not fields:
+            out.append("    [dim]no fields[/]")
+            continue
+        for field_name, field_type in fields.items():
+            out.append(f"    {escape(field_name)} [dim]{escape(field_type)}[/]")
+    return out
+
+
+def _first_numeric_field(obj, path=()):
+    """Return (value, path) for the first numeric scalar in a message, or None."""
+    if isinstance(obj, bool):
+        return None
+    if isinstance(obj, (int, float)):
+        return obj, path
+    if hasattr(obj, "get_fields_and_field_types"):
+        for name in obj.get_fields_and_field_types():
+            value = getattr(obj, name)
+            result = _first_numeric_field(value, path + (name,))
+            if result is not None:
+                return result
+    if isinstance(obj, (list, tuple)) and obj:
+        result = _first_numeric_field(obj[0], path + (0,))
+        if result is not None:
+            return result
+    return None
 
 
 def topic_name_cell(name: str) -> Text:
@@ -201,6 +279,83 @@ class CommandForm(ModalScreen[dict | None]):
         ]
         payload = self.query_one("#command_payload", TextArea).text
         self.dismiss({"fields": values, "payload": payload})
+
+
+class CommandPalette(ModalScreen[str | None]):
+    """A modal fuzzy finder over topics, nodes, services and actions."""
+
+    CSS = """
+    CommandPalette {
+        align: center middle;
+        background: #000000 65%;
+    }
+    #palette_dialog {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        background: #121214;
+        border: round #3a3a3c;
+    }
+    #palette_filter {
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+    #palette_table {
+        width: 100%;
+        height: 18;
+        background: #121214;
+        border: none;
+        scrollbar-size: 1 1;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss_palette")]
+
+    def __init__(self, candidates: list[tuple[str, str, str]]) -> None:
+        super().__init__()
+        self.all_candidates = candidates
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="palette_dialog"):
+            yield Input(placeholder="type to filter...", id="palette_filter")
+            table = DataTable(id="palette_table", cursor_type="row")
+            table.add_column("Kind", width=8)
+            table.add_column("Name", width=45)
+            table.add_column("Detail", width=None)
+            table.zebra_stripes = False
+            table.show_header = False
+            yield table
+
+    def on_mount(self) -> None:
+        self.query_one("#palette_filter", Input).focus()
+        self._populate("")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "palette_filter":
+            self._populate(event.input.value.lower())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "palette_filter":
+            table = self.query_one("#palette_table", DataTable)
+            if table.row_count:
+                table.action_select_cursor()
+
+    def _populate(self, needle: str) -> None:
+        table = self.query_one("#palette_table", DataTable)
+        table.clear()
+        for kind, name, detail in self.all_candidates:
+            if needle in f"{kind} {name} {detail}".lower():
+                table.add_row(kind, name, detail, key=f"{kind}:{name}")
+        if table.row_count:
+            table.move_cursor(row=0)
+
+    def action_dismiss_palette(self) -> None:
+        self.dismiss(None)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.row_key is not None:
+            self.dismiss(event.row_key.value)
 
 
 class GraphCanvas(VerticalScroll):
@@ -332,6 +487,11 @@ class CommandCenterApp(App):
     #graph_legend {
         padding: 0 1;
     }
+    #topic_sparkline {
+        display: none;
+        height: 6;
+        margin: 1 0 0 0;
+    }
     #tf_view, #actions_view, #log_view, #diagnostics_view, #operations_view {
         width: 1fr;
         height: 1fr;
@@ -411,6 +571,7 @@ class CommandCenterApp(App):
     """
 
     BINDINGS = [
+        ("ctrl+p", "command_palette", "Search"),
         ("r", "refresh", "Refresh"),
         ("p", "toggle_pause", "Pause"),
         ("e", "toggle_echo", "Echo"),
@@ -418,9 +579,11 @@ class CommandCenterApp(App):
         ("m", "edit_parameter", "Parameter"),
         ("c", "call_service", "Call"),
         ("u", "publish_topic", "Publish"),
+        ("g", "send_action_goal", "Goal"),
         ("b", "record_bag", "Record"),
         ("l", "launch", "Launch"),
         ("s", "stop_processes", "Stop"),
+        ("L", "lifecycle_transition", "Lifecycle"),
         ("slash", "focus_filter", "Filter"),
         ("1", "switch_tab('topics')", "Topics"),
         ("2", "switch_tab('nodes')", "Nodes"),
@@ -464,12 +627,32 @@ class CommandCenterApp(App):
                                         "[dim]filter: topic, type, node[/]",
                                         id="graph_legend",
                                     )
-                        elif tab in ("tf", "actions", "logs", "diagnostics", "operations"):
+                        elif tab == "actions":
+                            with Horizontal(classes="split"):
+                                with Vertical(classes="panel list_panel"):
+                                    yield Static(
+                                        "[ actions ]", markup=False, classes="panel_title"
+                                    )
+                                    yield DataTable(
+                                        id="table_actions",
+                                        cursor_foreground_priority="css",
+                                    )
+                                with VerticalScroll(
+                                    classes="panel detail", id="detail_actions"
+                                ):
+                                    yield Static(
+                                        "[ inspector ]", markup=False, classes="panel_title"
+                                    )
+                                    yield Static(
+                                        "Select an action to inspect.",
+                                        id="info_actions",
+                                        classes="detail_info",
+                                    )
+                        elif tab in ("tf", "logs", "diagnostics", "operations"):
                             with Vertical(classes="panel"):
                                 yield Static(f"[ {tab} ]", markup=False, classes="panel_title")
                                 view_id = {
                                     "tf": "tf_view",
-                                    "actions": "actions_view",
                                     "logs": "log_view",
                                     "diagnostics": "diagnostics_view",
                                     "operations": "operations_view",
@@ -498,6 +681,11 @@ class CommandCenterApp(App):
                                         id=f"info_{tab}",
                                         classes="detail_info",
                                     )
+                                    if tab == "topics":
+                                        yield Sparkline(
+                                            data=[],
+                                            id="topic_sparkline",
+                                        )
                 with TabPane("\u2699", id="settings"):
                     with VerticalScroll(can_focus=True, id="settings_scroll"):
                         yield Static("[ settings ]", markup=False, classes="panel_title")
@@ -551,10 +739,17 @@ class CommandCenterApp(App):
         self.msg_times: deque[float] = deque(maxlen=HZ_WINDOW)
         self.msg_sizes: deque[tuple[float, int]] = deque(maxlen=HZ_WINDOW)
 
+        # Sparkline state
+        self.sparkline_path: list[str] = []
+        self.sparkline_values: deque[float] = deque(maxlen=50)
+
         # Control state
         self.node_parameters: dict[str, dict] = {}
         self.parameter_requests: set[str] = set()
+        self.node_lifecycle: dict[str, dict | None] = {}
+        self.lifecycle_requests: set[str] = set()
         self.control_clients = []
+        self.action_clients: list = []
         self.ephemeral_publishers = []
         self.processes: dict[str, subprocess.Popen] = {}
         self.operation_events: deque[str] = deque(maxlen=20)
@@ -596,6 +791,7 @@ class CommandCenterApp(App):
             "topics": (("Topic", 17), ("Interface", 17), ("Activity", 16)),
             "nodes": (("Node", None), ("Pub", 5), ("Sub", 5), ("Srv", 5), ("Cli", 5)),
             "services": (("Service", None), ("Type", None), ("Servers", 9)),
+            "actions": (("Action", 18), ("Type", 18), ("Servers", 7), ("Clients", 7)),
         }
         for tab, cols in columns.items():
             table = self.query_one(f"#table_{tab}", DataTable)
@@ -736,13 +932,46 @@ class CommandCenterApp(App):
             return
         self.query_one(f"#filter_{self.active_tab}", Input).focus()
 
+    def action_command_palette(self) -> None:
+        candidates = []
+        for name, topic in sorted(self.topics.items()):
+            candidates.append(("topic", name, ", ".join(topic["types"])))
+        for name, node in sorted(self.nodes.items()):
+            detail = f"pub:{len(node['pubs'])} sub:{len(node['subs'])} srv:{len(node['services'])}"
+            candidates.append(("node", name, detail))
+        for name, srv in sorted(self.services.items()):
+            candidates.append(("service", name, ", ".join(srv["types"])))
+        for name, action in sorted(self.actions.items()):
+            candidates.append(("action", name, ", ".join(action["types"])))
+        self.push_screen(CommandPalette(candidates), self.on_command_palette)
+
+    def on_command_palette(self, result: str | None) -> None:
+        if not result:
+            return
+        kind, name = result.split(":", 1)
+        tab_map = {"topic": "topics", "node": "nodes", "service": "services", "action": "actions"}
+        tab = tab_map.get(kind)
+        if not tab:
+            return
+        self.query_one(f"#filter_{tab}", Input).value = name
+        self.selected[tab] = name
+        self.fill_table(tab)
+        if tab == "topics":
+            self.start_echo(name)
+        elif tab == "nodes":
+            self.request_node_parameters(name)
+            self.request_node_lifecycle(name)
+        self.update_details(tab)
+        self.query_one(TabbedContent).active = tab
+        self.action_switch_tab(tab)
+
     def action_switch_tab(self, tab: str) -> None:
         self.query_one(TabbedContent).active = tab
         if tab == "topics":
             self.query_one("#table_topics", DataTable).focus()
         elif tab == "graph":
             self.query_one("#graph_canvas", GraphCanvas).focus()
-        elif tab in ("tf", "actions", "logs", "diagnostics", "operations"):
+        elif tab in ("tf", "logs", "diagnostics", "operations"):
             self.query_one(f"#{tab}_scroll", VerticalScroll).focus()
         elif tab == "settings":
             self.query_one("#settings_scroll", VerticalScroll).focus()
@@ -1076,10 +1305,25 @@ class CommandCenterApp(App):
                 )
                 for name, n in sorted(self.nodes.items())
             ]
-        return [
-            (name, (name, ", ".join(s["types"]), len(s["servers"])))
-            for name, s in sorted(self.services.items())
-        ]
+        if tab == "services":
+            return [
+                (name, (name, ", ".join(s["types"]), len(s["servers"])))
+                for name, s in sorted(self.services.items())
+            ]
+        if tab == "actions":
+            return [
+                (
+                    name,
+                    (
+                        name,
+                        ", ".join(a["types"]),
+                        len(a["servers"]),
+                        len(a["clients"]),
+                    ),
+                )
+                for name, a in sorted(self.actions.items())
+            ]
+        return []
 
     def fill_table(self, tab: str) -> None:
         """Rebuild a graph view from cache, keeping its selection."""
@@ -1089,9 +1333,6 @@ class CommandCenterApp(App):
             return
         if tab == "tf":
             self.update_tf(needle)
-            return
-        if tab == "actions":
-            self.update_actions(needle)
             return
         if tab == "operations":
             self.update_operations()
@@ -1125,6 +1366,9 @@ class CommandCenterApp(App):
     def _searchable(self, tab: str, key: str) -> str:
         if tab == "topics":
             return " ".join([key, *self.topics[key]["types"]])
+        if tab == "actions":
+            action = self.actions[key]
+            return " ".join([key, *action["types"], *action["servers"], *action["clients"]])
         return key
 
     def update_graph(self, needle: str = "") -> None:
@@ -1278,39 +1522,36 @@ class CommandCenterApp(App):
             trees.extend((tree, Text("")))
         view.update(Group(*trees[:-1]))
 
-    def update_actions(self, needle: str = "") -> None:
-        needle = needle or self.query_one("#filter_actions", Input).value.lower()
-        view = self.query_one("#actions_view", Static)
-        if not _ACTIONS_AVAILABLE:
-            view.update(Text("ROS action graph support is unavailable.", style="#ff4f55"))
+    def update_action_details(self) -> None:
+        name = self.selected["actions"]
+        info = self.query_one("#info_actions", Static)
+        action = self.actions.get(name)
+        if not action:
+            info.update("[dim]No action selected.[/]")
             return
-        flows = []
-        for name, action in sorted(self.actions.items()):
-            searchable = " ".join(
-                [name, *action["types"], *action["servers"], *action["clients"]]
-            ).lower()
-            if needle not in searchable:
-                continue
-            clients = Text("\n".join(action["clients"]) or "no clients", style="#d7d7d7")
-            center = Text(name, style="bold #00b7ff")
-            center.append("\n")
-            center.append(", ".join(action["types"]), style="#666666")
-            servers = Text("\n".join(action["servers"]) or "no server", style="#d7d7d7")
-            flow = Table.grid(expand=True, padding=(0, 1))
-            flow.add_column(ratio=2)
-            flow.add_column(width=6, justify="center")
-            flow.add_column(ratio=3)
-            flow.add_column(width=6, justify="center")
-            flow.add_column(ratio=2)
-            flow.add_row(
-                clients,
-                Text("────▶", style="#ffffff" if action["clients"] else "#666666"),
-                center,
-                Text("────▶", style="#ffffff" if action["servers"] else "#ff4f55"),
-                servers,
-            )
-            flows.extend((flow, Text("")))
-        view.update(Group(*flows[:-1]) if flows else Text("No matching actions.", style="#666666"))
+        if not _ACTIONS_AVAILABLE:
+            info.update(Text("ROS action graph support is unavailable.", style="#ff4f55"))
+            return
+
+        lines = [
+            f"[b]{escape(name)}[/]",
+            f"[dim]Type[/]  {escape(', '.join(action['types']))}",
+        ]
+        if action["types"]:
+            lines += ["", "[b]Definition[/]"]
+            lines += interface_definition_lines(action["types"][0], "action")
+        lines += [
+            "",
+            f"[b]Servers[/] [dim]({len(action['servers'])})[/]",
+        ]
+        lines += [f"  [#00b7ff]•[/] {escape(s)}" for s in action["servers"]] or ["  [dim]none[/]"]
+        lines += [
+            "",
+            f"[b]Clients[/] [dim]({len(action['clients'])})[/]",
+        ]
+        lines += [f"  [#00b7ff]•[/] {escape(c)}" for c in action["clients"]] or ["  [dim]none[/]"]
+        lines += ["", "[dim]press g to send a goal[/]"]
+        info.update("\n".join(lines))
 
     def update_operations(self) -> None:
         lines = [
@@ -1319,9 +1560,12 @@ class CommandCenterApp(App):
             "[dim]m[/] edit selected node parameter",
             "[dim]c[/] call selected service",
             "[dim]u[/] publish to selected topic",
+            "[dim]g[/] send goal to selected action",
+            "[dim]L[/] lifecycle transition for selected node",
             "[dim]b[/] start rosbag recording",
             "[dim]l[/] start a launch file",
             "[dim]s[/] stop processes started here",
+            "[dim]ctrl+p[/] open global command palette",
             "",
             "[b]Managed processes[/]",
         ]
@@ -1437,7 +1681,7 @@ class CommandCenterApp(App):
             self.query_one("#table_topics", DataTable).focus()
         elif tab == "graph":
             self.query_one("#graph_canvas", GraphCanvas).focus()
-        elif tab in ("tf", "actions", "logs", "diagnostics", "operations"):
+        elif tab in ("tf", "logs", "diagnostics", "operations"):
             self.query_one(f"#{tab}_scroll", VerticalScroll).focus()
         else:
             self.query_one(f"#table_{tab}", DataTable).focus()
@@ -1458,6 +1702,7 @@ class CommandCenterApp(App):
             self.start_echo(key)
         elif tab == "nodes" and key:
             self.request_node_parameters(key)
+            self.request_node_lifecycle(key)
         self.update_details(tab)
 
     # ---------------------------------------------------------------- details
@@ -1469,6 +1714,8 @@ class CommandCenterApp(App):
             self.update_node_details()
         elif tab == "services":
             self.update_service_details()
+        elif tab == "actions":
+            self.update_action_details()
 
     def update_topic_details(self) -> None:
         name = self.selected["topics"]
@@ -1481,6 +1728,12 @@ class CommandCenterApp(App):
         lines = [
             f"[b]{escape(name)}[/]",
             f"[dim]Type[/]      {escape(', '.join(topic['types']))}",
+        ]
+        if topic["types"]:
+            lines += ["", "[b]Definition[/]"]
+            lines += interface_definition_lines(topic["types"][0], "msg")
+        lines += [
+            "",
             f"[dim]Rate[/]      {self.hz_text()}",
             f"[dim]Bandwidth[/] {self.bandwidth_text()}",
             "",
@@ -1569,6 +1822,37 @@ class CommandCenterApp(App):
         finally:
             self.parameter_requests.discard(node_name)
 
+    def request_node_lifecycle(self, node_name: str) -> None:
+        if not _LIFECYCLE_AVAILABLE:
+            return
+        if node_name in self.lifecycle_requests or node_name in self.node_lifecycle:
+            return
+        try:
+            client = self.node.create_client(GetState, f"{node_name}/get_state")
+            if not client.wait_for_service(timeout_sec=0):
+                return
+            self.lifecycle_requests.add(node_name)
+            self.control_clients.append(client)
+            future = client.call_async(GetState.Request())
+            future.add_done_callback(lambda done: self.on_lifecycle_state(node_name, done))
+        except Exception:
+            self.lifecycle_requests.discard(node_name)
+
+    def on_lifecycle_state(self, node_name: str, future) -> None:
+        try:
+            response = future.result()
+            state = response.current_state
+            self.node_lifecycle[node_name] = {
+                "id": state.id,
+                "label": state.label,
+            }
+        except Exception:
+            self.node_lifecycle[node_name] = None
+        finally:
+            self.lifecycle_requests.discard(node_name)
+        if self.selected["nodes"] == node_name:
+            self.update_node_details()
+
     def update_node_details(self) -> None:
         name = self.selected["nodes"]
         info = self.query_one("#info_nodes", Static)
@@ -1591,6 +1875,14 @@ class CommandCenterApp(App):
             for topic, types in entries:
                 lines.append(f"  [#00b7ff]•[/] {escape(topic)}")
                 lines.append(f"    [dim]{escape(', '.join(types))}[/]")
+        lifecycle = self.node_lifecycle.get(name)
+        lines += ["", "[b]Lifecycle[/] [dim](L to transition)[/]"]
+        if lifecycle is None:
+            lines.append("  [dim]unknown[/]")
+        elif not lifecycle:
+            lines.append("  [dim]not a lifecycle node[/]")
+        else:
+            lines.append(f"  State: {escape(lifecycle['label'])} [dim](id={lifecycle['id']})[/]")
         parameters = self.node_parameters.get(name)
         lines += ["", "[b]Parameters[/] [dim](m to edit)[/]"]
         if parameters is None:
@@ -1603,6 +1895,129 @@ class CommandCenterApp(App):
                 lines.append(f"  {escape(parameter_name)} [dim]= {escape(rendered)}[/]")
         info.update("\n".join(lines))
 
+    def action_lifecycle_transition(self) -> None:
+        node_name = self.selected.get("nodes")
+        if not node_name:
+            self.notify_control("Select a node first", error=True)
+            return
+        lifecycle = self.node_lifecycle.get(node_name)
+        if not lifecycle:
+            self.notify_control(f"{node_name} does not appear to be a lifecycle node", error=True)
+            return
+        self.push_screen(
+            CommandForm(
+                "Lifecycle transition",
+                [("transition", "configure")],
+                "",
+            ),
+            lambda result: self.change_lifecycle_state(node_name, result),
+        )
+
+    def change_lifecycle_state(self, node_name: str, result: dict | None) -> None:
+        if result is None or not _LIFECYCLE_AVAILABLE:
+            return
+        transition_name = result["fields"][0].strip().lower()
+        transition_id = LIFECYCLE_TRANSITIONS.get(transition_name)
+        if transition_id is None:
+            self.notify_control(f"Unknown transition: {transition_name}", error=True)
+            return
+        try:
+            client = self.node.create_client(ChangeState, f"{node_name}/change_state")
+            if not client.wait_for_service(timeout_sec=0.2):
+                self.notify_control("change_state service is unavailable", error=True)
+                return
+            request = ChangeState.Request()
+            request.transition.id = transition_id
+            request.transition.label = transition_name
+            self.control_clients.append(client)
+            future = client.call_async(request)
+            future.add_done_callback(
+                lambda done: self.on_lifecycle_changed(node_name, transition_name, done)
+            )
+        except Exception as exc:
+            self.notify_control(f"Lifecycle error: {exc}", error=True)
+
+    def on_lifecycle_changed(self, node_name: str, transition_name: str, future) -> None:
+        try:
+            response = future.result()
+            if response.success:
+                self.notify_control(f"Transition '{transition_name}' sent to {node_name}")
+                self.node_lifecycle.pop(node_name, None)
+                self.request_node_lifecycle(node_name)
+            else:
+                self.notify_control(
+                    f"Transition '{transition_name}' failed for {node_name}", error=True
+                )
+        except Exception as exc:
+            self.notify_control(f"Lifecycle error: {exc}", error=True)
+
+    def action_send_action_goal(self) -> None:
+        if not _ACTION_CLIENT_AVAILABLE:
+            self.notify_control("Action client support is unavailable", error=True)
+            return
+        action_name = self.selected.get("actions")
+        action = self.actions.get(action_name) if action_name else None
+        if not action or not action["types"]:
+            self.notify_control("Select an action first", error=True)
+            return
+        self.push_screen(
+            CommandForm(
+                f"Send goal to {action_name}",
+                [],
+                "",
+            ),
+            lambda result: self.send_action_goal(action_name, action["types"][0], result),
+        )
+
+    def send_action_goal(self, action_name: str, type_name: str, result: dict | None) -> None:
+        if result is None:
+            return
+        goal_yaml = result.get("payload", "")
+        try:
+            action_cls = get_action(type_name)
+            goal_msg = action_cls.Goal()
+            if goal_yaml.strip():
+                set_message_fields(goal_msg, yaml.safe_load(goal_yaml) or {})
+            client = ActionClient(self.node, action_cls, action_name)
+            if not client.wait_for_server(timeout_sec=0.5):
+                self.notify_control(f"Action server {action_name} not available", error=True)
+                return
+            self.action_clients.append(client)
+            self.notify_control(f"Sending goal to {action_name}...")
+            send_goal_future = client.send_goal_async(
+                goal_msg,
+                feedback_callback=lambda fb: self.on_action_feedback(action_name, fb),
+            )
+            send_goal_future.add_done_callback(
+                lambda done: self.on_action_goal_response(action_name, done)
+            )
+        except Exception as exc:
+            self.notify_control(f"Action goal error: {exc}", error=True)
+
+    def on_action_goal_response(self, action_name: str, future) -> None:
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.notify_control(f"Goal rejected by {action_name}", error=True)
+                return
+            self.notify_control(f"Goal accepted by {action_name}")
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(
+                lambda done: self.on_action_result(action_name, done)
+            )
+        except Exception as exc:
+            self.notify_control(f"Goal response error: {exc}", error=True)
+
+    def on_action_result(self, action_name: str, future) -> None:
+        try:
+            result = future.result().result
+            self.notify_control(f"Goal finished on {action_name}: {result}")
+        except Exception as exc:
+            self.notify_control(f"Goal result error on {action_name}: {exc}", error=True)
+
+    def on_action_feedback(self, action_name: str, feedback) -> None:
+        self.notify_control(f"Feedback from {action_name}")
+
     def update_service_details(self) -> None:
         name = self.selected["services"]
         info = self.query_one("#info_services", Static)
@@ -1614,6 +2029,10 @@ class CommandCenterApp(App):
         lines = [
             f"[b]{escape(name)}[/]",
             f"[dim]Type[/]  {escape(', '.join(srv['types']))}",
+        ]
+        if srv["types"]:
+            lines += ["", "[b]Definition[/]"] + interface_definition_lines(srv["types"][0], "srv")
+        lines += [
             "",
             f"[b]Servers[/] [dim]({len(srv['servers'])})[/]",
         ]
@@ -1626,7 +2045,7 @@ class CommandCenterApp(App):
         echo = "on" if self.echo_enabled else "off"
         self.query_one("#status_bar", Static).update(
             f"{now}  ·  {state}  ·  echo {echo}  ·  "
-            "[dim]/ filter  1-9/0 views  r refresh  m/c/u controls  b/l/s processes[/]"
+            "[dim]/ filter  1-9/0 views  r refresh  m/c/g/L  b/l/s  ^p[/]"
         )
 
     # ------------------------------------------------------------ echo / Hz
@@ -1645,6 +2064,10 @@ class CommandCenterApp(App):
         except Exception as exc:  # noqa: BLE001 - type not installed locally
             self.echo_error = f"cannot load {type_name}: {exc}"
             return
+
+        self.sparkline_path = []
+        self.sparkline_values.clear()
+        self._set_sparkline_visibility(False)
 
         # Best-effort is compatible with both reliable and best-effort publishers.
         # Mirror durability so latched (transient local) topics still deliver.
@@ -1673,6 +2096,10 @@ class CommandCenterApp(App):
             self.msg_times.clear()
         if hasattr(self, "msg_sizes"):
             self.msg_sizes.clear()
+        if hasattr(self, "sparkline_values"):
+            self.sparkline_values.clear()
+            self.sparkline_path = []
+            self._set_sparkline_visibility(False)
 
     def on_echo_message(self, msg) -> None:
         now = time.monotonic()
@@ -1681,6 +2108,32 @@ class CommandCenterApp(App):
         self.msg_times.append(now)
         try:
             self.msg_sizes.append((now, len(serialize_message(msg))))
+        except Exception:  # noqa: BLE001
+            pass
+        self._update_sparkline(msg)
+
+    def _update_sparkline(self, msg) -> None:
+        try:
+            if not self.sparkline_path:
+                result = _first_numeric_field(msg)
+                if result is None:
+                    return
+                value, path = result
+                self.sparkline_path = list(path)
+                self.sparkline_values.append(float(value))
+                self._set_sparkline_visibility(True)
+            else:
+                value = msg
+                for segment in self.sparkline_path:
+                    value = value[segment] if isinstance(segment, int) else getattr(value, segment)
+                self.sparkline_values.append(float(value))
+            self.query_one("#topic_sparkline").data = list(self.sparkline_values)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_sparkline_visibility(self, visible: bool) -> None:
+        try:
+            self.query_one("#topic_sparkline").display = visible
         except Exception:  # noqa: BLE001
             pass
 
