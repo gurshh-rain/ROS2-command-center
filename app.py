@@ -31,7 +31,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, DataTable, Input, Label, Static, TabbedContent, TabPane, TextArea,
+    Button, DataTable, Input, Label, Select, Static, TabbedContent, TabPane, TextArea,
 )
 
 try:
@@ -361,7 +361,7 @@ class CommandCenterApp(App):
     }
     DataTable > .datatable--cursor {
         background: #2c2c2e;
-        color: #eeeeee;
+        color: #ffffff;
         text-style: bold;
     }
     .detail {
@@ -374,6 +374,27 @@ class CommandCenterApp(App):
     }
     .detail_info {
         padding: 1;
+    }
+    #settings_scroll {
+        padding: 1 2;
+    }
+    .settings_label {
+        color: #8e8e93;
+        margin-top: 1;
+    }
+    .settings_value {
+        color: #e5e5ea;
+    }
+    #settings_scroll Select {
+        width: 20;
+        margin: 0 0 1 0;
+    }
+    #settings_scroll Input {
+        width: 20;
+        margin: 0 0 1 0;
+    }
+    #apply_settings {
+        margin: 1 0;
     }
     #status_bar {
         height: 2;
@@ -404,6 +425,7 @@ class CommandCenterApp(App):
         ("7", "switch_tab('logs')", "Logs"),
         ("8", "switch_tab('diagnostics')", "Diagnostics"),
         ("9", "switch_tab('operations')", "Operations"),
+        ("0", "switch_tab('settings')", "Settings"),
         ("q", "quit", "Quit"),
     ]
 
@@ -457,7 +479,7 @@ class CommandCenterApp(App):
                                     yield Static(f"[ {tab} ]", markup=False, classes="panel_title")
                                     yield DataTable(
                                         id=f"table_{tab}",
-                                        cursor_foreground_priority="renderable",
+                                        cursor_foreground_priority="css",
                                     )
                                 with VerticalScroll(
                                     classes="panel detail", id=f"detail_{tab}"
@@ -470,6 +492,26 @@ class CommandCenterApp(App):
                                         id=f"info_{tab}",
                                         classes="detail_info",
                                     )
+                with TabPane("\u2699", id="settings"):
+                    with VerticalScroll(can_focus=True, id="settings_scroll"):
+                        yield Static("[ settings ]", markup=False, classes="panel_title")
+                        yield Static("Theme", classes="settings_label")
+                        yield Select(
+                            [("Dark", "dark"), ("Light", "light")],
+                            allow_blank=False,
+                            value="dark",
+                            id="theme_select",
+                        )
+                        yield Static("Refresh interval (seconds)", classes="settings_label")
+                        yield Input(value=f"{REFRESH_SECONDS:g}", id="refresh_input")
+                        yield Static("ROS_DOMAIN_ID", classes="settings_label")
+                        yield Static(
+                            f"[#8e8e93]{os.environ.get('ROS_DOMAIN_ID', '0')}[/]",
+                            classes="settings_value",
+                            id="domain_value",
+                        )
+                        yield Button("Apply", id="apply_settings", variant="primary")
+
             yield Static("", id="status_bar")
 
     # ------------------------------------------------------------------ setup
@@ -534,6 +576,7 @@ class CommandCenterApp(App):
             self.tf_static_sub = None
 
         self.paused = False
+        self.refresh_seconds = REFRESH_SECONDS
 
         columns = {
             "topics": (("Topic", 20), ("Interface", 20), ("Activity", 20)),
@@ -550,7 +593,7 @@ class CommandCenterApp(App):
                 table.add_column(label, width=width, key=label.lower())
 
         self.refresh_graph()
-        self.refresh_timer = self.set_interval(REFRESH_SECONDS, self.refresh_graph)
+        self.refresh_timer = self.set_interval(self.refresh_seconds, self.refresh_graph)
         self.set_interval(SPIN_SECONDS, self.spin_once)
         self.set_interval(0.5, self.update_topic_details)
         self.set_interval(0.3, self.update_logs)
@@ -675,6 +718,8 @@ class CommandCenterApp(App):
         )
 
     def action_focus_filter(self) -> None:
+        if self.active_tab == "settings":
+            return
         self.query_one(f"#filter_{self.active_tab}", Input).focus()
 
     def action_switch_tab(self, tab: str) -> None:
@@ -685,8 +730,34 @@ class CommandCenterApp(App):
             self.query_one("#graph_canvas", GraphCanvas).focus()
         elif tab in ("tf", "actions", "logs", "diagnostics", "operations"):
             self.query_one(f"#{tab}_scroll", VerticalScroll).focus()
+        elif tab == "settings":
+            self.query_one("#settings_scroll", VerticalScroll).focus()
         else:
             self.query_one(f"#table_{tab}", DataTable).focus()
+
+    def apply_settings(self) -> None:
+        theme = self.query_one("#theme_select", Select).value
+        refresh_text = self.query_one("#refresh_input", Input).value
+        try:
+            new_refresh = float(refresh_text)
+            if new_refresh <= 0:
+                raise ValueError
+        except ValueError:
+            self.notify_control("Refresh interval must be a positive number", error=True)
+            return
+        self.refresh_seconds = new_refresh
+        self.refresh_timer.stop()
+        self.refresh_timer = self.set_interval(self.refresh_seconds, self.refresh_graph)
+        if self.paused:
+            self.refresh_timer.pause()
+        self.app.dark = theme == "dark"
+        self.notify_control(
+            f"Settings applied: theme={theme}, refresh={self.refresh_seconds:g}s"
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply_settings":
+            self.apply_settings()
 
     @property
     def active_tab(self) -> str:
@@ -1502,11 +1573,11 @@ class CommandCenterApp(App):
 
     def update_status(self) -> None:
         now = datetime.now().strftime("%H:%M:%S")
-        state = "[#ffb000]paused[/]" if self.paused else f"refresh {REFRESH_SECONDS:g}s"
+        state = "[#ffb000]paused[/]" if self.paused else f"refresh {self.refresh_seconds:g}s"
         echo = "on" if self.echo_enabled else "off"
         self.query_one("#status_bar", Static).update(
             f"{now}  ·  {state}  ·  echo {echo}  ·  "
-            "[dim]/ filter  1-9 views  r refresh  m/c/u controls  b/l/s processes[/]"
+            "[dim]/ filter  1-9/0 views  r refresh  m/c/u controls  b/l/s processes[/]"
         )
 
     # ------------------------------------------------------------ echo / Hz
