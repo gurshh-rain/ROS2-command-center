@@ -65,7 +65,7 @@ LOG_LEVELS = {
     50: ("FATAL", "#ff4f55"),
 }
 DIAGNOSTIC_LEVELS = {
-    0: ("OK", "#00d72f"),
+    0: ("OK", "#ffffff"),
     1: ("WARN", "#ffb000"),
     2: ("ERROR", "#ff4f55"),
     3: ("STALE", "#8e8e93"),
@@ -122,7 +122,7 @@ def topic_type_cell(types: list[str]) -> Text:
 
 def topic_activity_cell(publishers: int, subscribers: int) -> Text:
     if publishers and subscribers:
-        state, color = "● CONN", "#00d72f"
+        state, color = "● CONN", "#ffffff"
     elif publishers:
         state, color = "● PUB", "#00b7ff"
     elif subscribers:
@@ -151,7 +151,7 @@ class CommandForm(ModalScreen[dict | None]):
     }
     #command_title {
         height: 2;
-        color: #00d72f;
+        color: #ffffff;
         text-style: bold;
     }
     CommandForm Input {
@@ -235,7 +235,7 @@ class CommandCenterApp(App):
     #graph_status {
         width: auto;
         content-align: right middle;
-        color: #00d72f;
+        color: #ffffff;
     }
     TabbedContent {
         height: 1fr;
@@ -258,7 +258,7 @@ class CommandCenterApp(App):
         background: #1c1c1e;
     }
     Tab.-active {
-        color: #00d72f;
+        color: #ffffff;
         background: #121214;
         text-style: bold;
         border-bottom: none;
@@ -284,7 +284,7 @@ class CommandCenterApp(App):
         color: #555555;
     }
     Input:focus {
-        border-bottom: solid #00d72f;
+        border-bottom: solid #ffffff;
     }
     .split {
         height: 1fr;
@@ -450,7 +450,7 @@ class CommandCenterApp(App):
                                 with Vertical(classes="panel legend_panel"):
                                     yield Static("[ legend ]", markup=False, classes="panel_title")
                                     yield Static(
-                                        "[#00d72f]● active[/]\n"
+                                        "[#ffffff]● active[/]\n"
                                         "[#ff4f55]● no publisher[/]\n"
                                         "[#ffb000]● no subscriber[/]\n\n"
                                         "[b]Flow[/]\n"
@@ -764,7 +764,7 @@ class CommandCenterApp(App):
         return self.query_one(TabbedContent).active or "topics"
 
     def notify_control(self, message: str, error: bool = False) -> None:
-        color = "#ff4f55" if error else "#00d72f"
+        color = "#ff4f55" if error else "#ffffff"
         self.operation_events.appendleft(message)
         self.query_one("#status_bar", Static).update(f"[{color}]{escape(message)}[/]")
         self.update_operations()
@@ -1148,9 +1148,9 @@ class CommandCenterApp(App):
             flow.add_column(ratio=2)
             flow.add_row(
                 publisher_text,
-                Text("────▶", style="#00d72f" if publishers else "#ff4f55"),
+                Text("────▶", style="#ffffff" if publishers else "#ff4f55"),
                 topic_text,
-                Text("────▶", style="#00d72f" if subscribers else "#ffb000"),
+                Text("────▶", style="#ffffff" if subscribers else "#ffb000"),
                 subscriber_text,
             )
             flows.extend((flow, Text("")))
@@ -1214,7 +1214,7 @@ class CommandCenterApp(App):
                 elif len(edge["times"]) > 1:
                     span = edge["times"][-1] - edge["times"][0]
                     hz = (len(edge["times"]) - 1) / span if span > 0 else 0.0
-                    metric, color = f"{hz:.1f} Hz", "#00d72f"
+                    metric, color = f"{hz:.1f} Hz", "#ffffff"
                 else:
                     metric, color = "waiting", "#ffb000"
                 label = Text(child, style="#d7d7d7")
@@ -1255,9 +1255,9 @@ class CommandCenterApp(App):
             flow.add_column(ratio=2)
             flow.add_row(
                 clients,
-                Text("────▶", style="#00d72f" if action["clients"] else "#666666"),
+                Text("────▶", style="#ffffff" if action["clients"] else "#666666"),
                 center,
-                Text("────▶", style="#00d72f" if action["servers"] else "#ff4f55"),
+                Text("────▶", style="#ffffff" if action["servers"] else "#ff4f55"),
                 servers,
             )
             flows.extend((flow, Text("")))
@@ -1279,7 +1279,7 @@ class CommandCenterApp(App):
         active = []
         for label, process in list(self.processes.items()):
             if process.poll() is None:
-                active.append(f"  [#00d72f]●[/] {escape(label)}  pid {process.pid}")
+                active.append(f"  [#ffffff]●[/] {escape(label)}  pid {process.pid}")
             else:
                 self.processes.pop(label, None)
         lines += active or ["  [dim]none[/]"]
