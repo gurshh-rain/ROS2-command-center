@@ -396,6 +396,11 @@ class CommandCenterApp(App):
     }
     #apply_settings {
         margin: 1 0;
+        padding: 0 2;
+        background: #2c2c2e;
+        color: #ffffff;
+        border: round #2c2c2e;
+        text-style: bold;
     }
     #status_bar {
         height: 2;
@@ -511,6 +516,13 @@ class CommandCenterApp(App):
                             classes="settings_value",
                             id="domain_value",
                         )
+                        yield Static("Graph style", classes="settings_label")
+                        yield Select(
+                            [("Tree", "tree"), ("Flow arrows", "arrows")],
+                            allow_blank=False,
+                            value="tree",
+                            id="graph_style_select",
+                        )
                         yield Button("Apply", id="apply_settings", variant="primary")
 
             yield Static("", id="status_bar")
@@ -578,6 +590,7 @@ class CommandCenterApp(App):
 
         self.paused = False
         self.refresh_seconds = REFRESH_SECONDS
+        self.graph_style = "tree"
 
         columns = {
             "topics": (("Topic", 17), ("Interface", 17), ("Activity", 16)),
@@ -738,6 +751,7 @@ class CommandCenterApp(App):
 
     def apply_settings(self) -> None:
         theme = self.query_one("#theme_select", Select).value
+        self.graph_style = self.query_one("#graph_style_select", Select).value
         refresh_text = self.query_one("#refresh_input", Input).value
         try:
             new_refresh = float(refresh_text)
@@ -753,8 +767,10 @@ class CommandCenterApp(App):
             self.refresh_timer.pause()
         self.app.theme = f"textual-{theme}"
         self.app.dark = theme == "dark"
+        if self.active_tab == "graph":
+            self.update_graph()
         self.notify_control(
-            f"Settings applied: theme={theme}, refresh={self.refresh_seconds:g}s"
+            f"Settings: theme={theme}, graph={self.graph_style}, refresh={self.refresh_seconds:g}s"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1112,7 +1128,7 @@ class CommandCenterApp(App):
         return key
 
     def update_graph(self, needle: str = "") -> None:
-        flows = []
+        matches = []
         for name, topic in sorted(self.topics.items()):
             if name in self.hidden:
                 continue
@@ -1129,40 +1145,71 @@ class CommandCenterApp(App):
             searchable = " ".join([name, *topic["types"], *publishers, *subscribers]).lower()
             if needle not in searchable:
                 continue
+            matches.append((name, topic, publishers, subscribers))
 
-            publisher_text = Text("\n".join(publishers), style="#d7d7d7")
-            if not publishers:
-                publisher_text = Text("missing publisher", style="bold #ff4f55")
-
-            topic_text = Text(name, style="bold #00b7ff")
-            topic_text.append("\n")
-            topic_text.append(", ".join(topic["types"]), style="#666666")
-
-            subscriber_text = Text("\n".join(subscribers), style="#d7d7d7")
-            if not subscribers:
-                subscriber_text = Text("missing subscriber", style="bold #ffb000")
-
-            flow = Table.grid(expand=True, padding=(0, 1))
-            flow.add_column(ratio=2)
-            flow.add_column(width=6, justify="center")
-            flow.add_column(ratio=3)
-            flow.add_column(width=6, justify="center")
-            flow.add_column(ratio=2)
-            flow.add_row(
-                publisher_text,
-                Text("────▶", style="#ffffff" if publishers else "#ff4f55"),
-                topic_text,
-                Text("────▶", style="#ffffff" if subscribers else "#ffb000"),
-                subscriber_text,
+        if not matches:
+            self.query_one("#graph_view", Static).update(
+                Text("No matching graph connections.", style="#666666")
             )
-            flows.extend((flow, Text("")))
+            return
 
-        graph = (
-            Group(*flows[:-1])
-            if flows
-            else Text("No matching graph connections.", style="#666666")
-        )
-        self.query_one("#graph_view", Static).update(graph)
+        if self.graph_style == "tree":
+            tree = Tree("graph", style="bold #f5f5f7")
+            for name, topic, publishers, subscribers in matches:
+                topic_branch = tree.add(
+                    Text(name, style="bold #00b7ff"), style="bold #00b7ff"
+                )
+
+                pub_node = topic_branch.add(
+                    Text("publishes", style="dim #636366"), style="dim #636366"
+                )
+                if publishers:
+                    for pub in publishers:
+                        pub_node.add(Text(pub, style="#f5f5f7"))
+                else:
+                    pub_node.add(Text("missing publisher", style="bold #ff4f55"))
+
+                sub_node = topic_branch.add(
+                    Text("subscribes", style="dim #636366"), style="dim #636366"
+                )
+                if subscribers:
+                    for sub in subscribers:
+                        sub_node.add(Text(sub, style="#f5f5f7"))
+                else:
+                    sub_node.add(Text("missing subscriber", style="bold #ffb000"))
+            self.query_one("#graph_view", Static).update(tree)
+        else:
+            flows = []
+            for name, topic, publishers, subscribers in matches:
+                publisher_text = Text("\n".join(publishers), style="#d7d7d7")
+                if not publishers:
+                    publisher_text = Text("missing publisher", style="bold #ff4f55")
+
+                topic_text = Text(name, style="bold #00b7ff")
+                topic_text.append("\n")
+                topic_text.append(", ".join(topic["types"]), style="#666666")
+
+                subscriber_text = Text("\n".join(subscribers), style="#d7d7d7")
+                if not subscribers:
+                    subscriber_text = Text("missing subscriber", style="bold #ffb000")
+
+                flow = Table.grid(expand=True, padding=(0, 1))
+                flow.add_column(ratio=2)
+                flow.add_column(width=6, justify="center")
+                flow.add_column(ratio=3)
+                flow.add_column(width=6, justify="center")
+                flow.add_column(ratio=2)
+                flow.add_row(
+                    publisher_text,
+                    Text("────▶", style="#ffffff" if publishers else "#ff4f55"),
+                    topic_text,
+                    Text("────▶", style="#ffffff" if subscribers else "#ffb000"),
+                    subscriber_text,
+                )
+                flows.extend((flow, Text("")))
+
+            graph = Group(*flows[:-1])
+            self.query_one("#graph_view", Static).update(graph)
 
     def on_tf(self, msg, is_static: bool) -> None:
         now = time.monotonic()
